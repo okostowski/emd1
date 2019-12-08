@@ -1,0 +1,12 @@
+base
+ggplot2
+plotly
+colorspace
+data.table
+VIM
+knitr
+qtlcharts
+lattice
+caret
+randomForest
+ggcorrplot

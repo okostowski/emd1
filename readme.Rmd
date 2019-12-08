@@ -1,0 +1,306 @@
+---
+title: "Eksploracja Masywnych Danych --- Projekt z analizy danych"
+author: "Oskar Kostowski"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    keep_md: yes
+  #rmarkdown::github_document:
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE, cache=TRUE)
+```
+
+## Wstęp
+
+Celem poniższego projektu jest analiza zbioru danych dotyczących pomiarów śledzi atlantyckich i warunków w jakich żyją, zbieranych w ciągu ostatnich 60 lat, i próba znalezienia przyczyn stopniowego spadku ich długości w ostatnich latach. W procesie tej analizy zbadano ewentualne zależności pomiędzy atrybutami zbioru i utworzono klasyfikator dokonujący predykcji rozmiaru śledzi na podstawie pozostałych pomiarów. W wyniku poniższych kroków sformułowano trzy główne czynniki wpływające na spadek długości śledzi w ostatnich latach.
+
+## Przygotowanie środowiska
+
+Poniższy kod ładuje wymagane biblioteki i zapewnia powtarzalność wyników:
+
+``` {r, results='hide'}
+library(ggplot2)
+library(plotly)
+library(VIM)
+library(knitr)
+library(ggcorrplot)
+library(caret)       
+library(randomForest)
+set.seed(42)
+```
+
+## Zbiór danych
+
+Zbiór danych składa się z pomiarów śledzi i warunków w jakich żyją, zebranych przez ostatnich 60 lat. Dane były pobierane z połowów komercyjnych jednostek. W ramach połowu jednej jednostki losowo wybierano od 50 do 100 sztuk trzyletnich śledzi.
+
+Kolejne kolumny w zbiorze danych to:
+
+* <span style="color:darkred">*length*</span> --- długość złowionego śledzia [cm];
+* *cfin1* --- dostępność planktonu [zagęszczenie Calanus finmarchicus gat. 1];
+* *cfin2* --- dostępność planktonu [zagęszczenie Calanus finmarchicus gat. 2];
+* *chel1* --- dostępność planktonu [zagęszczenie Calanus helgolandicus gat. 1];
+* *chel2* --- dostępność planktonu [zagęszczenie Calanus helgolandicus gat. 2];
+* *lcop1* --- dostępność planktonu [zagęszczenie widłonogów gat. 1];
+* *lcop2* --- dostępność planktonu [zagęszczenie widłonogów gat. 2];
+* *fbar* --- natężenie połowów w regionie [ułamek pozostawionego narybku];
+* *recr* --- roczny narybek [liczba śledzi];
+* *cumf* --- łączne roczne natężenie połowów w regionie [ułamek pozostawionego narybku];
+* *totaln* --- łączna liczba ryb złowionych w ramach połowu [liczba śledzi];
+* *sst* --- temperatura przy powierzchni wody [°C];
+* *sal* --- poziom zasolenia wody [Knudsen ppt];
+* *xmonth* --- miesiąc połowu [numer miesiąca];
+* *nao* --- oscylacja północnoatlantycka [mb].
+
+### Oryginalny zbiór
+
+Wczytywanie oryginalnego zbioru danych z wyspecyfikowaniem typu danych w kolumnach:
+
+```{r, cache=TRUE}
+sample <- read.csv("sledzie.csv", nrows = 100)
+df_classes <- sapply(sample, class) 
+df_classes <- replace(df_classes, df_classes=="factor", "numeric")
+all_df <- read.csv("sledzie.csv", colClasses = df_classes, fill=TRUE, na.string=c("NA", "?"))
+```
+
+Próbka danych ze zbioru:
+
+``` {r, echo=FALSE}
+kable(head(all_df,10), format = "markdown")
+```
+
+### Uzupełniony zbiór danych
+
+Oryginalny zbiór składa się z 52582 pomiarów, z czego 10094 (około 19%) zawiera brakujące wartości:
+
+```{r, echo=FALSE}
+data.frame(n_samples = nrow(all_df), n_missing_values = sum(apply(all_df, 1, anyNA)), percent_missing_values = sum(apply(all_df, 1, anyNA))/nrow(all_df))
+```
+
+Poniżej zostały zaprezentowane szczegółowe informacje na temat brakujących wartości pomiarów:
+
+```{r, echo=FALSE, message=FALSE}
+missing_aggr <- aggr(all_df, labels=names(all_df), ylab = c("Brakujące dane", "Wzorce braków w danych"), col=c("red"), sortVars=TRUE, cex.axis=0.75)
+```
+
+Można zauważyć, że braki w pomiarach dotyczą 7 atrybutów - dostępności poszczególnych gatunków planktonu oraz temperatury przy powierzchni wody. 
+
+Możliwym rozwiązaniem tego problemu byłoby użycie metody k-nn, aby uzupełniać brakujące dane w pomiarze na podstawie tych znajdujących się w najpodobniejszych do niego pomiarach.
+
+Po dokładniejszym przyjrzeniu się danym, okazuje się, że w przypadku większości takich wierszy można łatwo uzupełnić te braki, ponieważ otaczające je pomiary, pochodzące z tego samego połowu, są bardzo podobne lub identyczne, mogą więc być wykorzystane do wypełnienia braków, bez uszczerbku na ogólnej jakości zbioru.
+
+Ponieważ dane są uporządkowane chronologicznie można założyć, że jeśli dwa sąsiednie pomiary mają taką samą wartość atrybutu *xmonth* to mogą posłużyć do uzupełnienia braków sąsiada. Aby uprościć proces, w przypadku, jeśli sąsiednie pomiary pochodzą już z innego miesiąca lub mają takie same braki jak pomiar aktualnie uzupełniany to wartość brakująca jest nadpisywana przez średnią dla danego atrybutu w całym zbiorze.
+
+Brakujące dane uzupełnia następujący kod:
+
+``` {r, results='hide', cache=TRUE}
+missing_vals <- apply(all_df, 1, anyNA)
+
+if(missing_vals[1]){
+  for (x in 1:ncol(all_df)) {
+    if (is.na(all_df[1, x])) {
+      all_df[1, x] <- all_df[2, x]
+    }
+  }
+}
+
+for(i in 2:nrow(all_df)-1){
+  if(missing_vals[i]){
+    for (x in 1:ncol(all_df)) {
+      if (is.na(all_df[i, x])) {
+        if(!is.na(all_df[i - 1, x]) && (all_df$xmonth[i] == all_df$xmonth[i - 1])){
+          all_df[i, x] <- all_df[i - 1, x]
+        }else if(!is.na(all_df[i + 1, x]) && (all_df$xmonth[i] == all_df$xmonth[i + 1])){
+          all_df[i, x] <- all_df[i + 1, x]
+        }else{
+          all_df[i, x] <- mean(all_df[,x], na.rm = TRUE)
+        }
+      }
+    }
+  }
+}
+
+if(missing_vals[nrow(all_df)]){
+  for (x in 1:ncol(all_df)) {
+    if (is.na(all_df[nrow(all_df), x])) {
+      all_df[nrow(all_df), x] <- all_df[nrow(all_df)-1, x]
+    }
+  }
+}
+```
+
+Niestety atrybut *xmonth* nie wystarczy by jednoznacznie oddzielić kolejne lata pomiarów, ponieważ jego wartość zmienia się częściej niż by to wynikało z rzeczywistego okresu zbierania pomiarów:
+
+``` {r}
+months <- 0
+curr_month <-0
+for(i in 1:nrow(all_df)){
+  if(curr_month != all_df$xmonth[i]){
+    months <- months + 1
+    curr_month <- all_df$xmonth[i]
+  }
+}
+months/12
+```
+
+W związku z tym zostały utworzone sztuczne atrybuty *year* oraz *years_group*, dzielące zbiór odpowiednio na 60 i 10 równej wielkości grup. Jest to podział dokonany na potrzeby analizy i wizualizacji danych.
+
+``` {r, echo=FALSE, results='hide'}
+all_df <- mutate(all_df,year=X %/% (nrow(all_df)/60)+1)
+all_df <- mutate(all_df,years_group=X %/% (nrow(all_df)/10)+1)
+```
+
+## Analiza wartości atrybutów
+
+### Długość wyławianych śledzi
+
+Przebieg poniższego wykresu obrazuje stopniowy spadek rozmiaru śledzia z czasem:
+
+``` {r, echo=FALSE, }
+lengths <- aggregate(all_df$length, list(Years=all_df$years_group), mean)
+years_label <- c("1-6", "7-12", "13-18","19-24","25-30","31-36","37-42","43-48","49-54","55-60")
+
+p <- ggplot(data=all_df, aes(x=years_group, y=length, group=years_group)) +geom_boxplot() +scale_x_continuous(name = "Lata", breaks = c(1:10), labels=years_label)+scale_y_continuous(name = "Długość [cm]", breaks = c(19:33))
+
+ggplotly(p)
+
+```
+
+### Średnia dostępność planktonu
+
+``` {r, echo=FALSE, }
+m_cfin1 <- aggregate(all_df$cfin1, list(Years=all_df$years_group), mean)
+m_cfin2 <- aggregate(all_df$cfin2, list(Years=all_df$years_group), mean)
+p <- ggplot() +geom_line(data=m_cfin1, aes(x=Years, y=x, colour="cfin1")) + geom_line(data=m_cfin2, aes(x=Years, y=x, colour="cfin2")) +scale_x_continuous(name = "Lata", breaks = c(1:10), labels=years_label) +labs(y="Dostępność planktonu")
+
+ggplotly(p)
+
+```
+
+``` {r, echo=FALSE, }
+m_chel1 <- aggregate(all_df$chel1, list(Years=all_df$years_group), mean)
+m_chel2 <- aggregate(all_df$chel2, list(Years=all_df$years_group), mean)
+p <- ggplot() +geom_line(data=m_chel1, aes(x=Years, y=x, colour="chel1")) + geom_line(data=m_chel2, aes(x=Years, y=x, colour="chel2")) +scale_x_continuous(name = "Lata", breaks = c(1:10), labels=years_label) +labs(y="Dostępność planktonu")
+
+ggplotly(p)
+
+```
+
+``` {r, echo=FALSE, }
+m_lcop1 <- aggregate(all_df$lcop1, list(Years=all_df$years_group), mean)
+m_lcop2 <- aggregate(all_df$lcop2, list(Years=all_df$years_group), mean)
+p <- ggplot() +geom_line(data=m_lcop1, aes(x=Years, y=x, colour="lcop1")) + geom_line(data=m_lcop2, aes(x=Years, y=x, colour="lcop2")) +scale_x_continuous(name = "Lata", breaks = c(1:10), labels=years_label) +labs(y="Dostępność planktonu")
+
+ggplotly(p)
+
+```
+
+Na wykresach można zaobserwować zmniejszenie się dostępności wszystkich gatunków planktonu w ostatnich latach, co pokrywa się z mniejszymi rozmiarami osiąganymi przez śledzie. Zależność wydaje się być szczególnie widoczna w przypadku *chel1* i *lcop1*. Potwierdza to intuicyjny wniosek, że dostępność pokarmu może mieć znaczący wpływ na rozmiary ryb.
+
+### Dane dotyczące połowu śledzi
+
+``` {r, echo=FALSE, }
+m_fbar <- aggregate(all_df$fbar, list(Year=all_df$year), mean)
+m_cumf <- aggregate(all_df$cumf, list(Year=all_df$year), mean)
+
+p <- ggplot() +geom_line(data=m_fbar, aes(x=Year, y=x, colour="fbar")) + geom_line(data=m_cumf, aes(x=Year, y=x, colour="cumf")) +scale_x_continuous(name = "Lata")+scale_y_continuous(name = "[Ułamek pozostawionego narybku]")
+
+ggplotly(p)
+
+```
+
+``` {r, echo=FALSE, }
+m_recr <- aggregate(all_df$recr, list(Year=all_df$year), mean)
+m_totaln <- aggregate(all_df$totaln, list(Year=all_df$year), mean)
+
+p <- ggplot() +geom_line(data=m_recr, aes(x=Year, y=x, colour="recr")) + geom_line(data=m_totaln, aes(x=Year, y=x, colour="totaln")) +scale_x_continuous(name = "Lata")+scale_y_continuous(name = "[Liczba śledzi]")
+
+ggplotly(p)
+
+```
+
+Powyższe wykresy nie obrazują wyraźnych zależności. Szczególnie mała instensywność połowów przypada zarówno na okres osiągania przez śledzie największych jak i najmniejszych odnotowanych rozmiarów. Dodatkowo ze względu na problem z wyraźnym podziałem pomiarów na lata w zbiorze danych atrybuty "roczne" stają się mniej wiarygodne.
+
+### Dane dotyczące oceanu
+
+``` {r, echo=FALSE, }
+m_sst <- aggregate(all_df$sst, list(Year=all_df$year), mean)
+
+p <- ggplot() +geom_line(data=m_sst, aes(x=Year, y=x, colour="sst")) +scale_x_continuous(name = "Lata")+scale_y_continuous(name = "Temperatura przy powierzchni wody [°C]")
+
+ggplotly(p)
+
+```
+
+``` {r, echo=FALSE, }
+m_sal <- aggregate(all_df$sal, list(Year=all_df$year), mean)
+
+p <- ggplot() +geom_line(data=m_sal, aes(x=Year, y=x, colour="sal")) +scale_x_continuous(name = "Lata")+scale_y_continuous(name = "Poziom zasolenia wody [Knudsen ppt]")
+
+ggplotly(p)
+
+```
+
+``` {r, echo=FALSE, }
+m_nao <- aggregate(all_df$nao, list(Year=all_df$year), mean)
+
+p <- ggplot() +geom_line(data=m_nao, aes(x=Year, y=x, colour="nao")) +scale_x_continuous(name = "Lata")+scale_y_continuous(name = "Oscylacja północnoatlantycka [mb]")
+
+ggplotly(p)
+
+```
+
+Chociaż poziom zasolenia nie wydaje się mieć wielkiego wpływu na rozmiary śledzi, to wykresy sugerują znaczący wpływ temperatury wody i oscylacji północnoatlantyckiej w tej kwestii.
+
+## Badanie korelacji
+
+``` {r, echo=FALSE}
+corr <- round(cor(all_df[,2:16]), 1)
+ggcorrplot(corr)
+```
+
+Badanie wykazało istnienie korelacji między długością śledzi a dostępnością niektórych gatunków planktonu (*chel1* i *lcop1*) oraz ułamkiem pozostawionego narybku (*fbar*), a także odwrotnej korelacji z temperaturą przy powierzchni wody (*sst*) oraz oscylacją północnoatlantycką (*nao*). Można więc wnioskować, że na zmniejszenie się rozmiarów osiąganych przez śledzie wpłynęły zmniejszona dostępność pokarmu, niekorzystne warunki środowiska oraz zwiększone natężenie połowów. Dodatkowo można także zauważyć zależności między oscylacją a wspomnianymi miarami dostępności planktonu oraz temperaturą wody.
+
+## Klasyfikator
+
+W celu predykcji długości wyłowionej ryby została wykorzystana metoda RandomForest, a przyjętymi miarami oceny jakości klasyfikacji $R^2$ oraz $RMSE$. Poniżej zaprezentowany został kod tworzący i uczący model oraz wyniki jego działania.
+
+``` {r, cache=TRUE}
+rf_df <- all_df[,c(2:14,16)]
+
+inTraining <- createDataPartition(y = rf_df$length, p = 0.8, list = FALSE)
+
+training <- rf_df[inTraining, ]
+testing <- rf_df[-inTraining, ]
+
+Mtries <- tuneRF(training, training$length, ntree = 30, plot = FALSE)
+rfGrid <- expand.grid(mtry = Mtries)
+gridCtrl <- trainControl(method = "repeatedcv", number = 2, repeats = 5)
+
+fit <- train(length ~ ., data = training, method = "rf", metric = "RMSE", preProc = c("center", "scale"), trControl = gridCtrl, tuneGrid = rfGrid, ntree = 30, importance=TRUE)
+
+rfClasses <- predict(fit, newdata = testing)
+postResample(pred = rfClasses, obs = testing$length)
+```
+
+Wykres poniżej wskazuje jako najważniejsze atrybuty związane z dostępnością planktonu, temperaturę blisko powierzchni wody oraz łączną liczbę ryb wyłowionych w ramach połowu:
+
+``` {r, echo=FALSE}
+importance <- varImp(fit, scale = TRUE)
+importance_df <- data.frame(name = colnames(rf_df)[2:14], importance = importance$importance$Overall)
+p<-ggplot(data=importance_df, aes(x=name, y=importance)) +
+  geom_bar(stat="identity", fill="red") #+ coord_flip()
+ggplotly(p)
+```
+
+## Wnioski
+
+Na podstawie przeprowadzonej analizy można wyróżnić trzy czynniki, mające znaczny wpływ na spadającą długość śledzi w ostatnich latach:
+
+* dostępność pokarmu --- plankton stanowi główne źródło pokarmu śledzia atlantyckiego, więc jego dostępność stanowi dobrą podstawę do prób predykcji rozmiarów osiąganych przez ryby
+* warunki środowiskowe --- oscylacje północnoatlantyckie mogą wpływać na temperaturę wody, ta z kolei razem z zasoleniem, mogą stwarzać niekorzystne warunki dla śledzi, mogą też bezpośrednio wpływać na zmniejszenie dostępności planktonu
+* wpływ człowieka --- analiza wykazała, że intensywność połowów także ma wpływ na długość śledzi, która osiągała średnio większe wartości w okresie, gdy pozostawiano więcej narybku.
+
+Warto jednak podkreślić, że śledź atlantycki jest częścią większego ekosystemu i na jego rozwój wpływać będą liczne czynniki, które nie zostały uwzględnione w zbiorze danych. Być może na podstawie szerszego zbioru atrybutów udałoby się znaleźć więcej takich zależności.
